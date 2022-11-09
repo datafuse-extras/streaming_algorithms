@@ -449,7 +449,7 @@ where
 			for i in 0..1 << self.p {
 				let to = &mut counters[i];
 				let from = &src.counters.as_ref().unwrap()[i];
-				// From max to 0, merge the min counter
+				// From 0 to max, merge the min counter
 				for j in 0..max_width {
 					let idx = j as usize;
 					let from_counter = &from[idx];
