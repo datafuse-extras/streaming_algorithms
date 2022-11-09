@@ -43,6 +43,7 @@
 // https://github.com/twitter/algebird/blob/5fdb079447271a5fe0f1fba068e5f86591ccde36/algebird-core/src/main/scala/com/twitter/algebird/HyperLogLog.scala
 // https://spark.apache.org/docs/latest/api/scala/index.html#org.apache.spark.rdd.RDD countApproxDistinct
 // is_x86_feature_detected ?
+use rand::prelude::random;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -90,6 +91,7 @@ impl<V: Hash> New for HyperLogLogMagnitude<V> {
 		Self(New::new(config))
 	}
 }
+
 impl<V: Hash> Intersect for HyperLogLogMagnitude<V> {
 	fn intersect<'a>(iter: impl Iterator<Item = &'a Self>) -> Option<Self>
 	where
@@ -125,6 +127,8 @@ impl<V> IntersectPlusUnionIsPlus for HyperLogLogMagnitude<V> {
 /// An implementation of the [HyperLogLog](https://en.wikipedia.org/wiki/HyperLogLog) data structure with *bias correction*.
 ///
 /// See [*HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm*](http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf) and [*HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm*](https://ai.google/research/pubs/pub40671) for background on HyperLogLog with bias correction.
+/// HyperLogLog support of delete operation refer to:
+/// [Every Row Counts: Combining Sketches and Sampling for Accurate Group-By Result Estimates](https://db.in.tum.de/~freitag/papers/p23-freitag-cidr19.pdf)
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct HyperLogLog<V: ?Sized> {
@@ -133,6 +137,7 @@ pub struct HyperLogLog<V: ?Sized> {
 	sum: f64,
 	p: u8,
 	m: Box<[u8]>,
+	counters: Option<Vec<Box<[u8]>>>,
 	marker: PhantomData<fn(V)>,
 }
 
@@ -152,6 +157,26 @@ where
 			sum: f64::from(1 << p),
 			p,
 			m: vec![0; 1 << p].into_boxed_slice(),
+			counters: None,
+			marker: PhantomData,
+		}
+	}
+
+	/// Create an empty `HyperLogLog` data structure with the specified error tolerance.
+	/// Also create a counters to support delete operation.
+	pub fn new_with_counters(error_rate: f64) -> Self {
+		assert!(0.0 < error_rate && error_rate < 1.0);
+		let p = f64_to_u8((f64::log2(1.04 / error_rate) * 2.0).ceil());
+		assert!(0 < p && p < 64);
+		let alpha = Self::get_alpha(p);
+		let max_width = 64 - p as usize;
+		Self {
+			alpha,
+			zero: 1 << p,
+			sum: f64::from(1 << p),
+			p,
+			m: vec![0; 1 << p].into_boxed_slice(),
+			counters: Some(vec![vec![0; max_width].into_boxed_slice(); 1 << p]),
 			marker: PhantomData,
 		}
 	}
@@ -164,8 +189,15 @@ where
 			sum: usize_to_f64(hll.m.len()),
 			p: hll.p,
 			m: vec![0; hll.m.len()].into_boxed_slice(),
+			counters: hll.counters.clone(),
 			marker: PhantomData,
 		}
+	}
+
+	#[inline]
+	fn is_change_power(power: u8) -> bool {
+		assert!(power >= 1);
+		random::<u64>() % ((2 << (power - 1)) as u64) == 0
 	}
 
 	/// "Visit" an element.
@@ -175,9 +207,10 @@ where
 		value.hash(&mut hasher);
 		let x = hasher.finish();
 		let j = x & (self.m.len() as u64 - 1);
+		let index = usize::try_from(j).unwrap();
 		let w = x >> self.p;
 		let rho = Self::get_rho(w, 64 - self.p);
-		let mjr = &mut self.m[usize::try_from(j).unwrap()];
+		let mjr = &mut self.m[index];
 		let old = *mjr;
 		let new = cmp::max(old, rho);
 		self.zero -= if old == 0 { 1 } else { 0 };
@@ -186,7 +219,72 @@ where
 		self.sum -= f64::from_bits(u64::max_value().wrapping_sub(u64::from(old)) << 54 >> 2)
 			- f64::from_bits(u64::max_value().wrapping_sub(u64::from(new)) << 54 >> 2);
 
+		// update counters
+		if let Some(counters) = &mut self.counters {
+			let c = &mut counters[index];
+			let now_counter = &mut c[new as usize];
+			if *now_counter <= 128 {
+				*now_counter += 1;
+			} else {
+				if Self::is_change_power(*now_counter - 128) {
+					*now_counter += 1;
+				}
+			}
+		}
+
 		*mjr = new;
+	}
+
+	/// "Remove" an element.
+	#[inline]
+	pub fn delete(&mut self, value: &V) {
+		let max_width = 64 - self.p;
+		if let Some(counters) = &mut self.counters {
+			let mut hasher = XxHash::default();
+			value.hash(&mut hasher);
+			let x = hasher.finish();
+			let j = x & (self.m.len() as u64 - 1);
+			let index = usize::try_from(j).unwrap();
+			let w = x >> self.p;
+			let rho = Self::get_rho(w, max_width);
+			let c = &mut counters[index];
+			let old_counter = &mut c[rho as usize];
+			if *old_counter >= 1 {
+				if *old_counter <= 128 {
+					*old_counter -= 1;
+				} else {
+					if Self::is_change_power(*old_counter - 128) {
+						*old_counter -= 1;
+					}
+				}
+
+				// If counter reach zero, update bucket.
+				if *old_counter == 0 {
+					self.zero += if rho != 0 { 1 } else { 0 };
+					// see pow_bithack()
+					self.sum -=
+						f64::from_bits(u64::max_value().wrapping_sub(u64::from(rho)) << 54 >> 2);
+					// Find the biggest value less than rho
+					let mjr = &mut self.m[index];
+					for i in (0..rho - 1).rev() {
+						if c[i as usize] > 0 {
+							self.zero -= if i != 0 { 1 } else { 0 };
+							// see pow_bithack()
+							self.sum += f64::from_bits(
+								u64::max_value().wrapping_sub(u64::from(i)) << 54 >> 2,
+							);
+							*mjr = i;
+							return;
+						}
+					}
+					*mjr = 0;
+				}
+			}
+		} else {
+			unimplemented!(
+				"To support delete operation, create with HyperLogLog::new_with_counters"
+			);
+		}
 	}
 
 	/// Retrieve an estimate of the carginality of the stream.
@@ -264,6 +362,29 @@ where
 			self.zero = zero;
 			self.sum = sum;
 		}
+
+		if let Some(counters) = &mut self.counters {
+			let max_width = 64 - self.p;
+			for i in 0..1 << self.p {
+				let to = &mut counters[i];
+				let from = &src.counters.as_ref().unwrap()[i];
+				// From max to 0, merge the max counter
+				for j in (0..max_width).rev() {
+					let idx = j as usize;
+					let to_counter = &mut to[idx];
+					let from_counter = &from[idx];
+					if *to_counter > 0 || *from_counter > 0 {
+						*to_counter = *to_counter + *from_counter;
+						if *to_counter > 128 {
+							if Self::is_change_power(*to_counter - 128) {
+								*to_counter += 1;
+							}
+						}
+						break;
+					}
+				}
+			}
+		}
 	}
 
 	/// Intersect another HyperLogLog data structure into `self`.
@@ -273,6 +394,7 @@ where
 		assert_eq!(src.alpha, self.alpha);
 		assert_eq!(src.p, self.p);
 		assert_eq!(src.m.len(), self.m.len());
+		assert_eq!(src.counters.is_some(), self.counters.is_some());
 		#[cfg(all(
 			feature = "packed_simd",
 			any(target_arch = "x86", target_arch = "x86_64")
@@ -321,15 +443,44 @@ where
 			self.zero = zero;
 			self.sum = sum;
 		}
+
+		if let Some(counters) = &mut self.counters {
+			let max_width = 64 - self.p;
+			for i in 0..1 << self.p {
+				let to = &mut counters[i];
+				let from = &src.counters.as_ref().unwrap()[i];
+				// From max to 0, merge the min counter
+				for j in 0..max_width {
+					let idx = j as usize;
+					let from_counter = &from[idx];
+					let to_counter = &mut to[idx];
+					if *from_counter > 0 || *to_counter > 0 {
+						*to_counter = *to_counter + *from_counter;
+						if *to_counter > 128 {
+							if Self::is_change_power(*to_counter - 128) {
+								*to_counter += 1;
+							}
+						}
+						break;
+					}
+				}
+			}
+		}
 	}
 
 	/// Clears the `HyperLogLog` data structure, as if it was new.
 	pub fn clear(&mut self) {
+		let max_width = 64 - self.p;
 		self.zero = self.m.len();
 		self.sum = usize_to_f64(self.m.len());
 		self.m.iter_mut().for_each(|x| {
 			*x = 0;
 		});
+		if let Some(counters) = &mut self.counters {
+			counters.iter_mut().for_each(|x| {
+				*x = vec![0; max_width as usize].into_boxed_slice();
+			});
+		}
 	}
 
 	fn get_threshold(p: u8) -> f64 {
@@ -403,6 +554,7 @@ impl<V: ?Sized> Clone for HyperLogLog<V> {
 			sum: self.sum,
 			p: self.p,
 			m: self.m.clone(),
+			counters: self.counters.clone(),
 			marker: PhantomData,
 		}
 	}
@@ -417,6 +569,28 @@ where
 			.finish()
 	}
 }
+
+impl<V: ?Sized> PartialEq for HyperLogLog<V>
+where
+	V: Hash,
+{
+	fn eq(&self, other: &Self) -> bool {
+		if self.len().eq(&other.len()) {
+			if let Some(self_counters) = &self.counters {
+				if let Some(other_counters) = &other.counters {
+					return other_counters == self_counters;
+				} else {
+					return false;
+				}
+			}
+		}
+
+		false
+	}
+}
+
+impl<V: ?Sized> Eq for HyperLogLog<V> where V: Hash {}
+
 impl<V: ?Sized> New for HyperLogLog<V>
 where
 	V: Hash,
@@ -646,5 +820,48 @@ mod test {
 
 		assert!(hll.len() > (actual - (actual * p * 3.0)));
 		assert!(hll.len() < (actual + (actual * p * 3.0)));
+	}
+
+	#[test]
+	fn compare_with_counters() {
+		let mut hll1 = HyperLogLog::new_with_counters(0.00408);
+		let mut hll2 = HyperLogLog::new_with_counters(0.00408);
+		hll1.push("test");
+		hll2.push("test");
+		assert_eq!(hll1, hll2);
+		hll2.push("test");
+		assert_ne!(hll1, hll2);
+	}
+
+	#[test]
+	fn compare_with_counters_union() {
+		let mut hll1 = HyperLogLog::new_with_counters(0.00408);
+		let mut hll2 = HyperLogLog::new_with_counters(0.00408);
+		hll1.push("test");
+		hll2.push("test");
+		hll1.union(&hll2);
+		let count = hll1.len();
+		hll1.delete("test");
+		// after first delete, len will not change.
+		assert_eq!(count, hll1.len());
+		hll1.delete("test");
+		// after second delete, len change to 0.
+		assert_eq!(0 as f64, hll1.len());
+	}
+
+	#[test]
+	fn delete() {
+		let mut hll = HyperLogLog::new_with_counters(0.00408);
+		// push "test" twice
+		for _i in 0..2 {
+			hll.push("test");
+		}
+		let count = hll.len();
+		hll.delete("test");
+		// after first delete, len will not change.
+		assert_eq!(count, hll.len());
+		hll.delete("test");
+		// after second delete, len change to 0.
+		assert_eq!(0 as f64, hll.len());
 	}
 }
