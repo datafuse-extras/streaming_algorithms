@@ -197,7 +197,11 @@ where
 	#[inline]
 	fn is_change_power(power: u8) -> bool {
 		assert!(power >= 1);
-		random::<u64>() % ((2 << (power - 1)) as u64) == 0
+		let p = u64::from(power);
+		if p >= u64::BITS as u64 {
+			return false;
+		}
+		random::<u64>() % (2 << (p - 1)) == 0
 	}
 
 	/// "Visit" an element.
@@ -374,11 +378,14 @@ where
 					let to_counter = &mut to[idx];
 					let from_counter = &from[idx];
 					if *to_counter > 0 || *from_counter > 0 {
-						*to_counter = *to_counter + *from_counter;
-						if *to_counter > 128 {
-							if Self::is_change_power(*to_counter - 128) {
+						if *to_counter as u16 + *from_counter as u16 > 128 {
+							if Self::is_change_power(
+								(*to_counter as u16 + *from_counter as u16 - 128) as u8,
+							) {
 								*to_counter += 1;
 							}
+						} else {
+							*to_counter = *to_counter + *from_counter;
 						}
 						break;
 					}
@@ -454,10 +461,11 @@ where
 					let idx = j as usize;
 					let from_counter = &from[idx];
 					let to_counter = &mut to[idx];
-					if *from_counter > 0 || *to_counter > 0 {
-						*to_counter = *to_counter + *from_counter;
-						if *to_counter > 128 {
-							if Self::is_change_power(*to_counter - 128) {
+					if *to_counter > 0 || *from_counter > 0 {
+						if *to_counter as u16 + *from_counter as u16 > 128 {
+							if Self::is_change_power(
+								(*to_counter as u16 + *from_counter as u16 - 128) as u8,
+							) {
 								*to_counter += 1;
 							}
 						}
@@ -820,6 +828,21 @@ mod test {
 
 		assert!(hll.len() > (actual - (actual * p * 3.0)));
 		assert!(hll.len() < (actual + (actual * p * 3.0)));
+	}
+
+	#[test]
+	fn union() {
+		let actual = 100_0000;
+		let p = 0.05;
+		let mut hll1 = HyperLogLog::new_with_counters(p);
+		for i in 0..actual {
+			hll1.push(&i);
+		}
+		let mut hll2 = HyperLogLog::new_with_counters(p);
+		for i in actual..actual * 2 {
+			hll2.push(&i);
+		}
+		hll1.union(&hll2);
 	}
 
 	#[test]
