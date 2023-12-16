@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use std::{
 	cmp::{self, Ordering}, convert::{identity, TryFrom}, fmt, hash::{Hash, Hasher}, marker::PhantomData, ops::{self, Range}
 };
+use borsh::{BorshDeserialize, BorshSerialize};
 use twox_hash::XxHash;
 
 use super::{f64_to_u8, u64_to_f64, usize_to_f64};
@@ -58,7 +59,7 @@ mod consts;
 use self::consts::{BIAS_DATA, RAW_ESTIMATE_DATA, TRESHOLD_DATA};
 
 /// Like [`HyperLogLog`] but implements `Ord` and `Eq` by using the estimate of the cardinality.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(bound = "")]
 pub struct HyperLogLogMagnitude<V>(HyperLogLog<V>);
 impl<V: Hash> Ord for HyperLogLogMagnitude<V> {
@@ -129,7 +130,7 @@ impl<V> IntersectPlusUnionIsPlus for HyperLogLogMagnitude<V> {
 /// See [*HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm*](http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf) and [*HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm*](https://ai.google/research/pubs/pub40671) for background on HyperLogLog with bias correction.
 /// HyperLogLog support of delete operation refer to:
 /// [Every Row Counts: Combining Sketches and Sampling for Accurate Group-By Result Estimates](https://db.in.tum.de/~freitag/papers/p23-freitag-cidr19.pdf)
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(bound = "")]
 pub struct HyperLogLog<V: ?Sized> {
 	alpha: f64,
